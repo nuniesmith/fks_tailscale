@@ -43,12 +43,13 @@ spec:
         image: tailscale/tailscale:latest
         imagePullPolicy: Always
         env:
+        # Support multiple secret key formats
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
               name: tailscale-auth
               key: authkey
-              optional: false
+              optional: true
         - name: TS_AUTH_KEY
           valueFrom:
             secretKeyRef:
