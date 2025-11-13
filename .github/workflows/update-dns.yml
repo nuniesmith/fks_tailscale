@@ -1,0 +1,169 @@
+name: Update Cloudflare DNS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update even if IP matches'
+        required: false
+        default: 'false'
+        type: boolean
+  schedule:
+    # Run daily at 2 AM UTC to check and update if needed
+    - cron: '0 2 * * *'
+
+env:
+  CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  DNS_RECORD_NAME: fkstrading.xyz
+  TAILSCALE_HOSTNAME: fkstrading-xyz
+
+jobs:
+  update-dns:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl for minikube
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config || echo "KUBECONFIG secret not set, using default"
+          chmod 600 ~/.kube/config
+
+      - name: Get Tailscale IP
+        id: get-ip
+        run: |
+          # Method 1: Try to get from Tailscale API (if accessible)
+          if [ -n "${{ secrets.TAILSCALE_API_KEY }}" ]; then
+            echo "Attempting to get IP from Tailscale API..."
+            TAILSCALE_IP=$(curl -s -H "Authorization: Bearer ${{ secrets.TAILSCALE_API_KEY }}" \
+              "https://api.tailscale.com/api/v2/device/fkstrading-xyz" \
+              | jq -r '.addresses[] | select(startswith("100."))' | head -1) || true
+          fi
+          
+          # Method 2: Get from Kubernetes service (if running)
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "Attempting to get IP from Kubernetes..."
+            TAILSCALE_IP=$(kubectl get svc tailscale-connector -n fks-trading -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "") || true
+          fi
+          
+          # Method 3: Resolve Tailscale hostname
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "Attempting to resolve Tailscale hostname..."
+            TAILSCALE_IP=$(dig +short ${TAILSCALE_HOSTNAME}.tailscale.ts.net | grep -E '^100\.' | head -1) || true
+          fi
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "❌ Could not determine Tailscale IP"
+            echo "Available methods:"
+            echo "1. Tailscale API key in secrets"
+            echo "2. Kubernetes service status"
+            echo "3. DNS resolution"
+            exit 1
+          fi
+          
+          echo "✅ Tailscale IP: $TAILSCALE_IP"
+          echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+
+      - name: Get current Cloudflare DNS record
+        id: get-dns
+        run: |
+          CURRENT_IP=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=A&name=${DNS_RECORD_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | jq -r '.result[0].content // empty')
+          
+          if [ -z "$CURRENT_IP" ]; then
+            echo "⚠️  DNS record not found, will create new record"
+            echo "current_ip=" >> $GITHUB_OUTPUT
+            echo "record_id=" >> $GITHUB_OUTPUT
+          else
+            RECORD_ID=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=A&name=${DNS_RECORD_NAME}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              | jq -r '.result[0].id // empty')
+            
+            echo "✅ Current DNS IP: $CURRENT_IP"
+            echo "current_ip=$CURRENT_IP" >> $GITHUB_OUTPUT
+            echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare IPs and update if needed
+        id: update-dns
+        run: |
+          TAILSCALE_IP="${{ steps.get-ip.outputs.tailscale_ip }}"
+          CURRENT_IP="${{ steps.get-dns.outputs.current_ip }}"
+          RECORD_ID="${{ steps.get-dns.outputs.record_id }}"
+          FORCE_UPDATE="${{ github.event.inputs.force_update }}"
+          
+          if [ "$TAILSCALE_IP" = "$CURRENT_IP" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            echo "✅ IPs match ($TAILSCALE_IP), no update needed"
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "🔄 IPs differ or force update requested"
+          echo "  Current DNS: $CURRENT_IP"
+          echo "  Tailscale IP: $TAILSCALE_IP"
+          
+          if [ -z "$RECORD_ID" ]; then
+            # Create new DNS record
+            echo "Creating new DNS record..."
+            RESPONSE=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"A\",\"name\":\"${DNS_RECORD_NAME}\",\"content\":\"${TAILSCALE_IP}\",\"ttl\":300}")
+            
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ DNS record created successfully"
+              echo "updated=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Failed to create DNS record"
+              echo "$RESPONSE" | jq '.'
+              exit 1
+            fi
+          else
+            # Update existing DNS record
+            echo "Updating existing DNS record..."
+            RESPONSE=$(curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"A\",\"name\":\"${DNS_RECORD_NAME}\",\"content\":\"${TAILSCALE_IP}\",\"ttl\":300}")
+            
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ DNS record updated successfully"
+              echo "updated=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Failed to update DNS record"
+              echo "$RESPONSE" | jq '.'
+              exit 1
+            fi
+          fi
+
+      - name: Summary
+        run: |
+          echo "## DNS Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tailscale IP | \`${{ steps.get-ip.outputs.tailscale_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Previous DNS IP | \`${{ steps.get-dns.outputs.current_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Updated | ${{ steps.update-dns.outputs.updated }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DNS Record | \`${DNS_RECORD_NAME}\` |" >> $GITHUB_STEP_SUMMARY
+
