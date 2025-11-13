@@ -45,7 +45,7 @@ jobs:
               continue-on-error: false
               run: |
                   TAILSCALE_IP=""
-                  
+
                   # Method 1: Try to get from Tailscale API (if accessible)
                   if [ -n "${{ secrets.TAILSCALE_API_KEY }}" ]; then
                     echo "Attempting to get IP from Tailscale API..."
