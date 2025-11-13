@@ -42,41 +42,110 @@ jobs:
 
             - name: Get Tailscale IP
               id: get-ip
+              continue-on-error: false
               run: |
+                  TAILSCALE_IP=""
+                  
                   # Method 1: Try to get from Tailscale API (if accessible)
                   if [ -n "${{ secrets.TAILSCALE_API_KEY }}" ]; then
                     echo "Attempting to get IP from Tailscale API..."
-                    TAILSCALE_IP=$(curl -s -H "Authorization: Bearer ${{ secrets.TAILSCALE_API_KEY }}" \
-                      "https://api.tailscale.com/api/v2/device/fkstrading-xyz" \
-                      | jq -r '.addresses[] | select(startswith("100."))' | head -1) || true
+                    API_RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.TAILSCALE_API_KEY }}" \
+                      "https://api.tailscale.com/api/v2/device/${TAILSCALE_HOSTNAME}" 2>/dev/null || echo "")
+                    
+                    if [ -n "$API_RESPONSE" ] && echo "$API_RESPONSE" | jq -e '.addresses' >/dev/null 2>&1; then
+                      TAILSCALE_IP=$(echo "$API_RESPONSE" | jq -r '.addresses[]? | select(startswith("100."))' | head -1)
+                      if [ -n "$TAILSCALE_IP" ]; then
+                        echo "✅ Got IP from Tailscale API: $TAILSCALE_IP"
+                      fi
+                    fi
                   fi
 
-                  # Method 2: Get from Kubernetes service (if running)
+                  # Method 2: Get from Kubernetes pod status (check pod IPs)
                   if [ -z "$TAILSCALE_IP" ]; then
-                    echo "Attempting to get IP from Kubernetes..."
-                    TAILSCALE_IP=$(kubectl get svc tailscale-connector -n fks-trading -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "") || true
+                    echo "Attempting to get IP from Kubernetes pod..."
+                    # Try to get from pod's status or annotations
+                    TAILSCALE_IP=$(kubectl get pod -n fks-trading -l app=tailscale-connector -o jsonpath='{.items[0].status.podIP}' 2>/dev/null | grep -E '^100\.' | head -1 || echo "")
+                    if [ -z "$TAILSCALE_IP" ]; then
+                      # Try to exec into pod and get IP
+                      TAILSCALE_IP=$(kubectl exec -n fks-trading -l app=tailscale-connector -- tailscale status --json 2>/dev/null | jq -r '.Self.addresses[]? | select(startswith("100."))' | head -1 || echo "")
+                    fi
+                    if [ -n "$TAILSCALE_IP" ]; then
+                      echo "✅ Got IP from Kubernetes: $TAILSCALE_IP"
+                    fi
                   fi
 
-                  # Method 3: Resolve Tailscale hostname
+                  # Method 3: Get from Kubernetes service (LoadBalancer)
+                  if [ -z "$TAILSCALE_IP" ]; then
+                    echo "Attempting to get IP from Kubernetes service..."
+                    TAILSCALE_IP=$(kubectl get svc tailscale-connector -n fks-trading -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+                    if [ -z "$TAILSCALE_IP" ]; then
+                      TAILSCALE_IP=$(kubectl get svc tailscale-connector -n fks-trading -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null | grep -E '^100\.' | head -1 || echo "")
+                    fi
+                    if [ -n "$TAILSCALE_IP" ]; then
+                      echo "✅ Got IP from Kubernetes service: $TAILSCALE_IP"
+                    fi
+                  fi
+
+                  # Method 4: Resolve Tailscale hostname via DNS
                   if [ -z "$TAILSCALE_IP" ]; then
                     echo "Attempting to resolve Tailscale hostname..."
-                    TAILSCALE_IP=$(dig +short ${TAILSCALE_HOSTNAME}.tailscale.ts.net | grep -E '^100\.' | head -1) || true
+                    if command -v dig >/dev/null 2>&1; then
+                      TAILSCALE_IP=$(dig +short ${TAILSCALE_HOSTNAME}.tailscale.ts.net 2>/dev/null | grep -E '^100\.' | head -1 || echo "")
+                    fi
+                    if [ -n "$TAILSCALE_IP" ]; then
+                      echo "✅ Got IP from DNS resolution: $TAILSCALE_IP"
+                    fi
                   fi
 
+                  # Method 5: Try to get from Tailscale status file (if accessible via kubectl)
                   if [ -z "$TAILSCALE_IP" ]; then
-                    echo "❌ Could not determine Tailscale IP"
-                    echo "Available methods:"
-                    echo "1. Tailscale API key in secrets"
-                    echo "2. Kubernetes service status"
-                    echo "3. DNS resolution"
-                    exit 1
+                    echo "Attempting to get IP from Tailscale status..."
+                    STATUS_JSON=$(kubectl exec -n fks-trading -l app=tailscale-connector -- tailscale status --json 2>/dev/null || echo "")
+                    if [ -n "$STATUS_JSON" ]; then
+                      TAILSCALE_IP=$(echo "$STATUS_JSON" | jq -r '.Self.addresses[]? | select(startswith("100."))' | head -1 || echo "")
+                      if [ -n "$TAILSCALE_IP" ]; then
+                        echo "✅ Got IP from Tailscale status: $TAILSCALE_IP"
+                      fi
+                    fi
                   fi
 
-                  echo "✅ Tailscale IP: $TAILSCALE_IP"
+                  # Final check - if still no IP, make it optional or use manual input
+                  if [ -z "$TAILSCALE_IP" ]; then
+                    echo "⚠️  Could not automatically determine Tailscale IP"
+                    echo ""
+                    echo "Available methods tried:"
+                    echo "  1. Tailscale API (requires TAILSCALE_API_KEY secret)"
+                    echo "  2. Kubernetes pod status"
+                    echo "  3. Kubernetes service LoadBalancer"
+                    echo "  4. DNS resolution (${TAILSCALE_HOSTNAME}.tailscale.ts.net)"
+                    echo "  5. Tailscale status command"
+                    echo ""
+                    echo "💡 Solutions:"
+                    echo "  - Add TAILSCALE_API_KEY to GitHub secrets"
+                    echo "  - Ensure Tailscale connector pod is running"
+                    echo "  - Manually set TAILSCALE_IP secret with current IP"
+                    echo "  - Check Tailscale admin console: https://login.tailscale.com/admin/machines"
+                    echo ""
+                    # Allow workflow to continue if TAILSCALE_IP secret is set manually
+                    if [ -n "${{ secrets.TAILSCALE_IP }}" ]; then
+                      TAILSCALE_IP="${{ secrets.TAILSCALE_IP }}"
+                      echo "✅ Using manually configured TAILSCALE_IP secret: $TAILSCALE_IP"
+                    else
+                      echo "❌ No Tailscale IP found and TAILSCALE_IP secret not set"
+                      echo "Setting workflow to continue but skip DNS update..."
+                      echo "tailscale_ip=" >> $GITHUB_OUTPUT
+                      echo "skip_update=true" >> $GITHUB_OUTPUT
+                      exit 0
+                    fi
+                  fi
+
+                  echo "✅ Final Tailscale IP: $TAILSCALE_IP"
                   echo "tailscale_ip=$TAILSCALE_IP" >> $GITHUB_OUTPUT
+                  echo "skip_update=false" >> $GITHUB_OUTPUT
 
             - name: Get current Cloudflare DNS record
               id: get-dns
+              if: steps.get-ip.outputs.skip_update != 'true'
               run: |
                   CURRENT_IP=$(curl -s -X GET \
                     "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=A&name=${DNS_RECORD_NAME}" \
@@ -157,12 +226,19 @@ jobs:
                   fi
 
             - name: Summary
+              if: always()
               run: |
                   echo "## DNS Update Summary" >> $GITHUB_STEP_SUMMARY
                   echo "" >> $GITHUB_STEP_SUMMARY
-                  echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-                  echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-                  echo "| Tailscale IP | \`${{ steps.get-ip.outputs.tailscale_ip }}\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Previous DNS IP | \`${{ steps.get-dns.outputs.current_ip }}\` |" >> $GITHUB_STEP_SUMMARY
-                  echo "| Updated | ${{ steps.update-dns.outputs.updated }} |" >> $GITHUB_STEP_SUMMARY
-                  echo "| DNS Record | \`${DNS_RECORD_NAME}\` |" >> $GITHUB_STEP_SUMMARY
+                  if [ "${{ steps.get-ip.outputs.skip_update }}" = "true" ]; then
+                    echo "⚠️ **Update Skipped** - Could not determine Tailscale IP" >> $GITHUB_STEP_SUMMARY
+                    echo "" >> $GITHUB_STEP_SUMMARY
+                    echo "See workflow logs for troubleshooting steps." >> $GITHUB_STEP_SUMMARY
+                  else
+                    echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+                    echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+                    echo "| Tailscale IP | \`${{ steps.get-ip.outputs.tailscale_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+                    echo "| Previous DNS IP | \`${{ steps.get-dns.outputs.current_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+                    echo "| Updated | ${{ steps.update-dns.outputs.updated }} |" >> $GITHUB_STEP_SUMMARY
+                    echo "| DNS Record | \`${DNS_RECORD_NAME}\` |" >> $GITHUB_STEP_SUMMARY
+                  fi
