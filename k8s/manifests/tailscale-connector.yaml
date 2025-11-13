@@ -48,6 +48,13 @@ spec:
             secretKeyRef:
               name: tailscale-auth
               key: authkey
+              optional: false
+        - name: TS_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tailscale-auth
+              key: TS_AUTHKEY
+              optional: true
         - name: TS_STATE_DIR
           value: "/var/lib/tailscale"
         - name: TS_USERSPACE
