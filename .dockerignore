@@ -12,8 +12,7 @@ docs/
 # Kubernetes manifests (not needed in image)
 k8s/
 
-# Scripts (already copied)
-scripts/
+# Note: scripts/ is needed for Dockerfile.tailscale, so not excluding it
 
 # Environment files
 .env

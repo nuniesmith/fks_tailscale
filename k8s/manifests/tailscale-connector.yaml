@@ -52,10 +52,10 @@ spec:
       serviceAccountName: tailscale-connector
       containers:
       - name: tailscale
-        # Use custom image or official Tailscale image
+        # Use FKS custom Tailscale image with enhancements
         # For local testing: use tailscale/tailscale:latest
         # For production: use nuniesmith/fks:tailscale-latest
-        image: tailscale/tailscale:latest
+        image: nuniesmith/fks:tailscale-latest
         imagePullPolicy: IfNotPresent
         env:
         # Support multiple secret key formats
