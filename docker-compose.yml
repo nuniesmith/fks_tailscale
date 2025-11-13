@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  tailscale:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nuniesmith/fks:tailscale-latest
+    container_name: tailscale-node
+    hostname: fkstrading-xyz
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_HOSTNAME=fkstrading-xyz
+      - TS_ACCEPT_DNS=true
+      - TS_EXTRA_ARGS=--accept-routes
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    labels:
+      - "com.fks.service=tailscale"
+      - "com.fks.type=connector"
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  tailscale-state:
+    driver: local
+

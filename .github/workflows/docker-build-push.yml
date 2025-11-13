@@ -1,0 +1,216 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main, master]
+
+env:
+  SERVICE_NAME: tailscale
+  DOCKER_USERNAME: nuniesmith
+  DOCKER_REPO: nuniesmith/fks
+  SERVICE_PORT: 41641
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Dockerfile
+        run: |
+          echo "Validating Dockerfile..."
+          if [ ! -f Dockerfile ]; then
+            echo "❌ Dockerfile not found"
+            exit 1
+          fi
+          echo "✅ Dockerfile exists"
+
+      - name: Validate docker-compose.yml
+        run: |
+          echo "Validating docker-compose.yml..."
+          if [ ! -f docker-compose.yml ]; then
+            echo "❌ docker-compose.yml not found"
+            exit 1
+          fi
+          # Basic syntax check
+          docker-compose config > /dev/null 2>&1 || echo "⚠️  docker-compose config validation (may require env vars)"
+          echo "✅ docker-compose.yml exists"
+
+      - name: Validate Kubernetes manifests
+        run: |
+          echo "Validating Kubernetes manifests..."
+          if [ ! -d k8s/manifests ]; then
+            echo "❌ k8s/manifests directory not found"
+            exit 1
+          fi
+          # Count YAML files
+          MANIFEST_COUNT=$(find k8s/manifests -name "*.yaml" -o -name "*.yml" | wc -l)
+          if [ "$MANIFEST_COUNT" -eq 0 ]; then
+            echo "⚠️  No Kubernetes manifests found"
+          else
+            echo "✅ Found $MANIFEST_COUNT Kubernetes manifest(s)"
+          fi
+
+  build-and-push:
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Clean up Docker system (free disk space)
+        run: |
+          docker system prune -f || true
+          docker builder prune -f || true
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REPO }}
+          tags: |
+            type=raw,value=${{ env.SERVICE_NAME }}-latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ env.SERVICE_NAME }}-,format=short
+            type=ref,event=branch,prefix=${{ env.SERVICE_NAME }}-
+            type=semver,pattern={{version}},prefix=${{ env.SERVICE_NAME }}-
+            type=semver,pattern={{major}}.{{minor}},prefix=${{ env.SERVICE_NAME }}-
+            type=semver,pattern={{major}},prefix=${{ env.SERVICE_NAME }}-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Use registry cache only (reduces disk usage on runner)
+          cache-from: type=registry,ref=nuniesmith/fks:tailscale-latest
+          cache-to: type=inline
+
+      - name: Image digest
+        run: echo ${{ steps.meta.outputs.digest }}
+
+      - name: Deploy to Kubernetes
+        if: success()
+        run: |
+          # Configure SSH
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/jump_key
+          chmod 600 ~/.ssh/jump_key
+          
+          # Add jump server to known hosts
+          ssh-keyscan -H github.fkstrading.xyz >> ~/.ssh/known_hosts 2>/dev/null || true
+          
+          # Configuration
+          SERVICE_NAME="${{ env.SERVICE_NAME }}"
+          IMAGE="${{ env.DOCKER_REPO }}:${{ env.SERVICE_NAME }}-latest"
+          NAMESPACE="fks-trading"
+          DEPLOYMENT_NAME="tailscale-connector"
+          CONTAINER_NAME="tailscale"
+          JUMP_SERVER="github.fkstrading.xyz"
+          JUMP_USER="github-actions"
+          K8S_HOST="${{ secrets.K8S_HOST }}"
+          K8S_USER="github-actions"
+          
+          echo "🚀 Deploying $SERVICE_NAME to Kubernetes"
+          echo "   Image: $IMAGE"
+          echo "   Deployment: $DEPLOYMENT_NAME"
+          echo "   Namespace: $NAMESPACE"
+          
+          # Setup K8s SSH key if provided
+          if [ -n "${{ secrets.K8S_SSH_KEY }}" ]; then
+            echo "${{ secrets.K8S_SSH_KEY }}" > ~/.ssh/k8s_key
+            chmod 600 ~/.ssh/k8s_key
+          fi
+          
+          # Function to run kubectl command
+          run_kubectl() {
+            local cmd="$1"
+            if [ -n "$K8S_HOST" ]; then
+              # Use K8s key if available, otherwise use jump key
+              if [ -f ~/.ssh/k8s_key ]; then
+                K8S_KEY_FILE=~/.ssh/k8s_key
+              else
+                K8S_KEY_FILE=~/.ssh/jump_key
+              fi
+              # SSH into K8s server via jump server
+              ssh -i "$K8S_KEY_FILE" -o ProxyJump=$JUMP_USER@$JUMP_SERVER -o StrictHostKeyChecking=no $K8S_USER@$K8S_HOST "$cmd"
+            else
+              # Run kubectl on jump server
+              ssh -i ~/.ssh/jump_key -o StrictHostKeyChecking=no $JUMP_USER@$JUMP_SERVER "$cmd"
+            fi
+          }
+          
+          # Check if StatefulSet exists (Tailscale uses StatefulSet)
+          echo "📋 Checking if StatefulSet exists..."
+          if run_kubectl "kubectl get statefulset $DEPLOYMENT_NAME -n $NAMESPACE" > /dev/null 2>&1; then
+            echo "✅ StatefulSet $DEPLOYMENT_NAME exists"
+            
+            # Get current image
+            CURRENT_IMAGE=$(run_kubectl "kubectl get statefulset $DEPLOYMENT_NAME -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}'" 2>/dev/null || echo "")
+            if [ -n "$CURRENT_IMAGE" ]; then
+              echo "   Current image: $CURRENT_IMAGE"
+            fi
+            echo "   New image: $IMAGE"
+            
+            # Update StatefulSet
+            echo "🔄 Updating StatefulSet..."
+            if run_kubectl "kubectl set image statefulset/$DEPLOYMENT_NAME $CONTAINER_NAME=$IMAGE -n $NAMESPACE"; then
+              echo "✅ Image updated"
+            else
+              echo "⚠️  Failed to update image, trying alternative method..."
+              PATCH_JSON="{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CONTAINER_NAME\",\"image\":\"$IMAGE\"}]}}}}"
+              if run_kubectl "kubectl patch statefulset $DEPLOYMENT_NAME -n $NAMESPACE -p '$PATCH_JSON'"; then
+                echo "✅ Image updated via patch"
+              else
+                echo "❌ Failed to update StatefulSet"
+                exit 1
+              fi
+            fi
+            
+            # Restart StatefulSet
+            echo "🔄 Restarting StatefulSet..."
+            run_kubectl "kubectl rollout restart statefulset/$DEPLOYMENT_NAME -n $NAMESPACE" || echo "⚠️  Failed to restart StatefulSet"
+            
+            # Wait for rollout
+            echo "⏳ Waiting for rollout to complete..."
+            run_kubectl "kubectl rollout status statefulset/$DEPLOYMENT_NAME -n $NAMESPACE --timeout=300s" || echo "⚠️  Rollout timeout"
+            
+            # Show status
+            echo ""
+            echo "📊 StatefulSet status:"
+            run_kubectl "kubectl get statefulset $DEPLOYMENT_NAME -n $NAMESPACE"
+            echo ""
+            echo "📊 Pod status:"
+            run_kubectl "kubectl get pods -n $NAMESPACE -l app=tailscale-connector" || \
+            echo "   (No pods found)"
+          else
+            echo "❌ StatefulSet $DEPLOYMENT_NAME not found in namespace $NAMESPACE"
+            echo "Available StatefulSets:"
+            run_kubectl "kubectl get statefulsets -n $NAMESPACE" || true
+            exit 1
+          fi
+          
+          echo "✅ Deployment complete!"
+

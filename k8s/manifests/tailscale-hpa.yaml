@@ -1,0 +1,76 @@
+---
+# Horizontal Pod Autoscaler for Tailscale Connector
+# Note: Tailscale nodes are typically unique and don't benefit from auto-scaling
+# This HPA is provided for reference but scaling should be done manually
+# Each node requires a unique hostname and auth key
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tailscale-connector-hpa
+  namespace: fks-trading
+  labels:
+    app: tailscale-connector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: tailscale-connector
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+
+---
+# Vertical Pod Autoscaler (optional, requires VPA operator)
+# Uncomment if VPA is installed in your cluster
+# apiVersion: autoscaling.k8s.io/v1
+# kind: VerticalPodAutoscaler
+# metadata:
+#   name: tailscale-connector-vpa
+#   namespace: fks-trading
+# spec:
+#   targetRef:
+#     apiVersion: apps/v1
+#     kind: StatefulSet
+#     name: tailscale-connector
+#   updatePolicy:
+#     updateMode: "Auto"
+#   resourcePolicy:
+#     containerPolicies:
+#     - containerName: tailscale
+#       minAllowed:
+#         cpu: 25m
+#         memory: 32Mi
+#       maxAllowed:
+#         cpu: 1000m
+#         memory: 512Mi
+

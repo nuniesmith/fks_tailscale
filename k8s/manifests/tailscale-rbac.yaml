@@ -17,7 +17,12 @@ metadata:
   name: tailscale-connector
   namespace: fks-trading
 rules:
-# Allow reading/writing the tailscale secret for state
+# Allow creating the tailscale secret for state (without resourceNames to allow creation)
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+  resourceNames: []  # Empty to allow creating new secrets
+# Allow reading/writing the tailscale secret for state (with resourceNames for existing secret)
 - apiGroups: [""]
   resources: ["secrets"]
   resourceNames: ["tailscale-connector"]
@@ -25,8 +30,11 @@ rules:
 # Allow reading own pod status
 - apiGroups: [""]
   resources: ["pods"]
-  resourceNames: ["tailscale-connector"]
   verbs: ["get", "list"]
+# Allow reading/writing events (for debugging)
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "create", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

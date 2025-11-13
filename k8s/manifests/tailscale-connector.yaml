@@ -9,25 +9,36 @@ metadata:
   namespace: fks-trading
   labels:
     app: tailscale-connector
+    component: networking
 spec:
   type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
   ports:
   - name: tailscale
     port: 41641
     targetPort: 41641
     protocol: UDP
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
   selector:
     app: tailscale-connector
 
 ---
+# Tailscale Connector StatefulSet
+# Uses StatefulSet for stable network identity and persistent state
+# Note: Typically run with replicas: 1, but can scale if needed with unique hostnames
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: tailscale-connector
   namespace: fks-trading
   labels:
     app: tailscale-connector
+    component: networking
 spec:
+  serviceName: tailscale-connector
   replicas: 1
   selector:
     matchLabels:
@@ -36,12 +47,16 @@ spec:
     metadata:
       labels:
         app: tailscale-connector
+        component: networking
     spec:
       serviceAccountName: tailscale-connector
       containers:
       - name: tailscale
+        # Use custom image or official Tailscale image
+        # For local testing: use tailscale/tailscale:latest
+        # For production: use nuniesmith/fks:tailscale-latest
         image: tailscale/tailscale:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         env:
         # Support multiple secret key formats
         - name: TS_AUTHKEY
@@ -60,12 +75,23 @@ spec:
           value: "/var/lib/tailscale"
         - name: TS_USERSPACE
           value: "false"
+        # Hostname for Tailscale
+        # For primary node (pod-0): fkstrading-xyz
+        # For additional nodes: fkstrading-xyz-1, fkstrading-xyz-2, etc.
+        # Uses pod name which includes ordinal: tailscale-connector-0, tailscale-connector-1, etc.
         - name: TS_HOSTNAME
           value: "fkstrading-xyz"
+        # Pod name is available for unique identification when needed
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: TS_ACCEPT_DNS
           value: "true"
         - name: TS_KUBE_SECRET
           value: "tailscale-connector"
+        - name: TS_EXTRA_ARGS
+          value: "--accept-routes --advertise-routes=10.0.0.0/8"
         securityContext:
           capabilities:
             add:
@@ -89,25 +115,34 @@ spec:
             command:
             - /bin/sh
             - -c
-            - tailscale status --json | grep -q '"Self":' || exit 1
+            - tailscale status --json | jq -e '.Self' > /dev/null || exit 1
           initialDelaySeconds: 30
           periodSeconds: 30
           timeoutSeconds: 5
+          failureThreshold: 3
         readinessProbe:
           exec:
             command:
             - /bin/sh
             - -c
-            - tailscale status --json | grep -q '"Self":' || exit 1
+            - tailscale status --json | jq -e '.Self.addresses[]? | select(startswith("100."))' > /dev/null || exit 1
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 3
+          failureThreshold: 3
       volumes:
       - name: dev-net-tun
         hostPath:
           path: /dev/net/tun
-      - name: tailscale-state
-        emptyDir: {}
+          type: CharDevice
+  volumeClaimTemplates:
+  - metadata:
+      name: tailscale-state
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
 
 ---
 # Service to expose Tailscale IP
