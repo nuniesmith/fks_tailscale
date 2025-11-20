@@ -115,7 +115,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - tailscale status --json | jq -e '.Self' > /dev/null || exit 1
+            - tailscale status | grep -q 'fkstrading-xyz' || exit 1
           initialDelaySeconds: 30
           periodSeconds: 30
           timeoutSeconds: 5
@@ -125,7 +125,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - tailscale status --json | jq -e '.Self.addresses[]? | select(startswith("100."))' > /dev/null || exit 1
+            - tailscale status | grep -q '100\.' || exit 1
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 3
